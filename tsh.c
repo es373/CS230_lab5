@@ -2,6 +2,7 @@
  * tsh - A tiny shell program with job control
  * 
  * <Put your name and login ID here>
+ * LeeWoojoo cs20170478
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,6 +166,62 @@ int main(int argc, char **argv)
 */
 void eval(char *cmdline) 
 {
+ char buf[MAXLINE];		//holds modified cmd as bounded
+ char *argv[MAXARGS];		
+ int bg;
+ pid_t pid;
+ struct job_t *jobptr;
+ sigset_t mask, prev;
+ 
+ strcpy(buf, cmdline);		// delimit the size of cmdline
+ bg=parseline(buf,argv);	// 1 if bg jobs; 0 if fg jobs;
+ 
+ if (argv[0] == NULL){
+  return;		// filename is empty
+ }
+
+ sigemptyset(&mask);
+ sigaddset(&mask, SIGCHLD);	//Prepare for blocking sigchld signal
+
+ 
+ if (!builtin_cmd(argv)){		
+  // not built_in cmd => assume we got the path of an executable file
+
+  sigprocmask(SIG_BLOCK,&mask,&prev);  // block SIGCHLD before forking child
+  
+  if ((pid=fork()) ==0) {		// not requested built-in cmds -> fork child process
+    /* Child */
+    sigprocmask(SIG_SETMASK,&prev,NULL);// unblock SIGCHLD before using execve	
+    setpgid(0,0);			// initiates pgid=pid (grouping)
+    if (execve(argv[0],argv,environ)<0){						
+	printf("%s: Command not found\n", argv[0]);		//invalid cmd
+        return;						//failing exit status (as nonzero)
+     }
+   }
+  
+  /* Parent */	
+  sigprocmask(SIG_BLOCK,&mask, NULL);	//block SIGCHLD to avoid race cond
+
+  int gstat = BG;		//ground status
+  if (!bg)
+     gstat=FG;
+
+  addjob(jobs, pid, gstat, cmdline); 
+
+  sigprocmask(SIG_SETMASK, &prev, NULL);
+
+  if (!bg){			
+   //int fstat;				// running in foreground -> wait until fg jobs are all terminated 
+   /* killing process here?*/
+   waitfg(pid);	
+  }
+  else{ 					//we shold print bg process
+	jobptr = getjobpid(jobs,pid);				//job_t having the current pid
+	printf("[%d] (%d), %s",jobptr->pid,jobptr->pid, cmdline);
+  }
+ }
+
+
     return;
 }
 
@@ -231,15 +288,95 @@ int parseline(const char *cmdline, char **argv)
  */
 int builtin_cmd(char **argv) 
 {
-    return 0;     /* not a builtin command */
+ // note that strcmp returns 0 if comparing strs are the same
+	
+ 
+ if (!strcmp(argv[0], "quit")) 		//quit cmd
+  exit(0);
+ else if (!strcmp(argv[0], "jobs")){	 
+  listjobs(jobs);			//used struct job_t jobs[MAXJOBS] and listjobs() to print the jobs list
+  return 1;
+ }
+ else if (!strcmp(argv[0],"bg") ){		// bg job
+  do_bgfg(argv);
+  return 1;
+ }
+ else if (!strcmp(argv[0],"fg") ){		// fg job
+  do_bgfg(argv);
+  return 1;
+ } 
+ else if (!strcmp(argv[0], "&")){
+  return 1;					//ignore a single & sign
+ }
+ else
+  return 0;     /* not a builtin command */
 }
 
 /* 
  * do_bgfg - Execute the builtin bg and fg commands
  */
 void do_bgfg(char **argv) 
-{
-    return;
+{ 
+ // Note that bg <job> changes a stopped bg job to a running bg job
+ // 	      fg <job> changes a stopped or running bg job to a running in the fg
+
+ // Also, both are awaken by SIGCONT signal
+
+ struct job_t *jobptr;
+ 
+ 
+ //argv[0] : fg or bg; argv[1] : ID; 
+ //First, we shall distinguish the type of ID and get the corr. jobptr
+
+ if (!argv[1]){		//No arguments
+  printf("message");
+  return;
+ }
+
+ if (argv[1][0] =='%'){		//JID
+   //assume that argv[1][1] points the rear part of %, i.e. original JID
+   int jid = atoi(&argv[1][1]);		//make JID(str) to num
+   jobptr = getjobjid(jobs,jid);	//similar to getjobpid(), but this uses jid
+
+   if (!jobptr){	//invalid
+	printf("msg");
+	return;
+   }
+ }
+ else if (isdigit(argv[1][0])){		//PID
+   pid_t numpid = atoi(argv[1]);		//make PID(str) to num
+   jobptr = getjobpid(jobs,numpid);
+  
+   if (!jobptr){	//invalid
+	printf("msg");
+	return;
+   }
+ }
+ else {		//argv[1] is neither for JID nor for PID
+   printf("msg_else");
+   return;
+ }
+
+ //Next, we do our main job : distinguish bg/fg and send SIGCONT
+ //We'll exploit kill function to send SIGCONT. 
+
+ if (!strcmp(argv[0],"bg")){ 		//bg
+  jobptr->state= BG;		//We should run BG
+  
+  pid_t pgid = -(jobptr->pid);	//negative pid brings its process group's id
+  kill(pgid,SIGCONT);
+  printf("[%d] (%d) %s", jobptr->jid, jobptr->pid, jobptr->cmdline);
+ } 
+ else if (!strcmp(argv[0],"fg")){
+  jobptr->state = FG;
+
+  pid_t pgid = -(jobptr->pid);	//negative pid brings its process group's id
+  kill(pgid,SIGCONT);
+
+  waitfg(-pgid);		// -pgid = original pid; tsh cannot work while fg is not done
+ }
+ 
+   return;
 }
 
 /* 
@@ -247,7 +384,18 @@ void do_bgfg(char **argv)
  */
 void waitfg(pid_t pid)
 {
-    return;
+ struct job_t *curjob = getjobpid(jobs, pid);	// returns &jobs[i] having that pid; returns NULL if invalid pid
+ pid_t fg_pid =	 fgpid(jobs);			// returns pid if cur fg job; returns 0 if no such job
+ 
+ if (!curjob || !fg_pid)			//invalid job or not fj job
+   return;
+ 	
+ //waitpid(pid,,WUNTRACED);	//return even if stopped
+
+ while(fg_pid==pid){		//busy loop if the given pid is for fg
+ 	sleep(1);
+ }
+ return;
 }
 
 /*****************
@@ -263,6 +411,16 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+ pid_t pid;
+ int olderrno =errno;
+ 
+ 
+ pid = waitpid(-1, NULL,WNOHANG);	//wait for any nonzero pid; WNOHANG returns 0 if no terminated childs
+ 
+ while (pid>0){
+  deletejob(jobs,pid);
+ }
+ errno= olderrno;		//replace to the restored one
     return;
 }
 
@@ -273,7 +431,17 @@ void sigchld_handler(int sig)
  */
 void sigint_handler(int sig) 
 {
-    return;
+ // Note that there is some 'process group' that contains foreground jobs
+ // we should return SIGINT along there
+
+ pid_t fg_pid =fgpid(jobs);	// pid of current fg jobs
+ pid_t pgid = -fg_pid;		// negative pid would bring its process group id 
+
+ if (fg_pid){			//if fg job exists
+  kill(pgid, SIGINT);	// send SIGINT to the corresponding process group
+  	
+ } 
+   return;
 }
 
 /*
@@ -283,7 +451,15 @@ void sigint_handler(int sig)
  */
 void sigtstp_handler(int sig) 
 {
-    return;
+ //This is similiar to sigint_handler()
+
+ pid_t fg_pid=fgpid(jobs);	//pid of cur fg jobs 
+ pid_t pgid = -fg_pid;		// its pgid 
+ 
+if (fg_pid){			//if fg job exists
+  kill(pgid, SIGTSTP);		//also send the signal to the corr. process group
+ }
+  return;
 }
 
 /*********************
