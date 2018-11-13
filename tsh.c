@@ -208,7 +208,7 @@ void eval(char *cmdline)
   
   addjob(jobs, pid, gstat, cmdline); 
   
-  sigprocmask(SIG_UNBLOCK, &mask_all, NULL);
+  sigprocmask(SIG_SETMASK, &prev, NULL);
 
   if (!bg){			
    // running in foreground -> wait until fg jobs are all terminated 
@@ -362,16 +362,21 @@ void do_bgfg(char **argv)
  if (!strcmp(argv[0],"bg")){ 		//bg
   jobptr->state= BG;		//We should run BG
   
-  pid_t pgid = -(jobptr->pid);	//negative pid brings its process group's id
-  kill(pgid,SIGCONT);
+  pid_t pgid = -(jobptr->pid);	//negative pid brings its process group's id (except -1)
+  int kval =kill(pgid,SIGCONT);
+  if (kval <0)			//fail kiling (due to invalid pgid)
+    unix_error("Kill error");
+ 
   printf("[%d] (%d) %s", jobptr->jid, jobptr->pid, jobptr->cmdline);
  } 
  else if (!strcmp(argv[0],"fg")){
   jobptr->state = FG;
 
   pid_t pgid = -(jobptr->pid);	//negative pid brings its process group's id
-  kill(pgid,SIGCONT);
-
+  int kval = kill(pgid,SIGCONT);
+  if (kval <0)			//fail killing
+    unix_error("Kill error");
+ 
   waitfg(-pgid);		// -pgid = original pid; tsh cannot work while fg is not done
  }
 
@@ -384,9 +389,9 @@ void do_bgfg(char **argv)
 void waitfg(pid_t pid)
 {
  struct job_t *curjob = getjobpid(jobs, pid);	// returns &jobs[i] having that pid; returns NULL if invalid pid
- pid_t fg_pid =	 fgpid(jobs);			// returns pid if cur fg job; returns 0 if no such job
+ pid_t fg_pid =	 fgpid(jobs);			// returns pid if cur fg job exists; returns 0 if no such job
  
- if (!curjob || !fg_pid)			//invalid job or not fj job
+ if (!curjob || !fg_pid)			//invalid job or no fj job
    return;
  	
 
@@ -409,16 +414,14 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
- //Note that we should reaps all available zombie children, so we need to use more broad option
+ //Note that we should reap all available zombie children, so we need to use more broad option
  pid_t pid;
  int chld_stat;
  int olderrno =errno;
  int broad_opt = WUNTRACED|WNOHANG;
 // WUNTRACED is related w/ stopped childs; WNOHANG concerns w/ jombie childs (terminated abnormally)
 
- 
  //wait for any nonzero pid satisfying the options
- 
  
  while((pid = waitpid(-1, &chld_stat, broad_opt))>0){;	//wait for any nonzero pid satisfying the options
   if (WIFEXITED(chld_stat)){		//terminated normally
@@ -442,7 +445,6 @@ void sigchld_handler(int sig)
     printf("Job [%d] (%d) stopped by signal %d\n",  chld_jid, pid, WSTOPSIG(chld_stat));
     // WSTOPSIG generates sig number of the child's status which is stopped
     
-   
   } 
 
  }
