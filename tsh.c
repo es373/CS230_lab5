@@ -171,7 +171,7 @@ void eval(char *cmdline)
  int bg;
  pid_t pid;
  struct job_t *jobptr;
- sigset_t mask, prev;
+ sigset_t mask_all, mask, prev;
  
  strcpy(buf, cmdline);		// delimit the size of cmdline
  bg=parseline(buf,argv);	// 1 if bg jobs; 0 if fg jobs;
@@ -182,7 +182,7 @@ void eval(char *cmdline)
 
  sigemptyset(&mask);
  sigaddset(&mask, SIGCHLD);	//Prepare for blocking sigchld signal
-
+ sigfillset(&mask_all);
  
  if (!builtin_cmd(argv)){		
   // not built_in cmd => assume we got the path of an executable file
@@ -195,29 +195,28 @@ void eval(char *cmdline)
     setpgid(0,0);			// initiates pgid=pid (grouping)
     if (execve(argv[0],argv,environ)<0){						
 	printf("%s: Command not found\n", argv[0]);		//invalid cmd
-        return;						//failing exit status (as nonzero)
+        exit(0);						//failing exit status (as nonzero)
      }
    }
   
   /* Parent */	
-  sigprocmask(SIG_BLOCK,&mask, NULL);	//block SIGCHLD to avoid race cond
-
+  sigprocmask(SIG_BLOCK,&mask_all, NULL);	//block SIGCHLD to avoid race cond
+  
   int gstat = BG;		//ground status
   if (!bg)
      gstat=FG;
-
+  
   addjob(jobs, pid, gstat, cmdline); 
-
-  sigprocmask(SIG_SETMASK, &prev, NULL);
+  
+  sigprocmask(SIG_UNBLOCK, &mask_all, NULL);
 
   if (!bg){			
-   //int fstat;				// running in foreground -> wait until fg jobs are all terminated 
-   /* killing process here?*/
+   // running in foreground -> wait until fg jobs are all terminated 
    waitfg(pid);	
   }
   else{ 					//we shold print bg process
 	jobptr = getjobpid(jobs,pid);				//job_t having the current pid
-	printf("[%d] (%d), %s",jobptr->pid,jobptr->pid, cmdline);
+	printf("[%d] (%d) %s",jobptr->jid,jobptr->pid, cmdline);
   }
  }
 
@@ -329,7 +328,7 @@ void do_bgfg(char **argv)
  //First, we shall distinguish the type of ID and get the corr. jobptr
 
  if (!argv[1]){		//No arguments
-  printf("message");
+  printf("%s command requires PID or %%jobid argument\n", argv[0]);
   return;
  }
 
@@ -339,7 +338,7 @@ void do_bgfg(char **argv)
    jobptr = getjobjid(jobs,jid);	//similar to getjobpid(), but this uses jid
 
    if (!jobptr){	//invalid
-	printf("msg");
+	printf("%s: No such job\n",argv[1]);
 	return;
    }
  }
@@ -348,12 +347,12 @@ void do_bgfg(char **argv)
    jobptr = getjobpid(jobs,numpid);
   
    if (!jobptr){	//invalid
-	printf("msg");
+	printf("(%d): No such process\n", numpid);
 	return;
    }
  }
  else {		//argv[1] is neither for JID nor for PID
-   printf("msg_else");
+   printf("%s: argument must be a PID or %%jobid\n", argv[0]);
    return;
  }
 
@@ -375,8 +374,8 @@ void do_bgfg(char **argv)
 
   waitfg(-pgid);		// -pgid = original pid; tsh cannot work while fg is not done
  }
- 
-   return;
+
+ return;
 }
 
 /* 
@@ -390,9 +389,8 @@ void waitfg(pid_t pid)
  if (!curjob || !fg_pid)			//invalid job or not fj job
    return;
  	
- //waitpid(pid,,WUNTRACED);	//return even if stopped
 
- while(fg_pid==pid){		//busy loop if the given pid is for fg
+ while(fgpid(jobs)==pid){		//busy loop if the given pid is for fg
  	sleep(1);
  }
  return;
@@ -411,15 +409,44 @@ void waitfg(pid_t pid)
  */
 void sigchld_handler(int sig) 
 {
+ //Note that we should reaps all available zombie children, so we need to use more broad option
  pid_t pid;
+ int chld_stat;
  int olderrno =errno;
+ int broad_opt = WUNTRACED|WNOHANG;
+// WUNTRACED is related w/ stopped childs; WNOHANG concerns w/ jombie childs (terminated abnormally)
+
+ 
+ //wait for any nonzero pid satisfying the options
  
  
- pid = waitpid(-1, NULL,WNOHANG);	//wait for any nonzero pid; WNOHANG returns 0 if no terminated childs
+ while((pid = waitpid(-1, &chld_stat, broad_opt))>0){;	//wait for any nonzero pid satisfying the options
+  if (WIFEXITED(chld_stat)){		//terminated normally
+    //sig =WEXITSTATUS(chld_stat);
+    deletejob(jobs,pid);
+  }
+  else if (WIFSIGNALED(chld_stat)){
+    int jid=pid2jid(pid);		//directly change pid -> jid (w/o calling getjobpid)
+
+    deletejob(jobs,pid);
+    printf("Job [%d] (%d) terminated by signal %d\n",  jid, pid, WTERMSIG(chld_stat));
+    // WTERMSIG generates sig number of the child's status which is terminated abnormally
+  }
+  else if (WIFSTOPPED(chld_stat)){
+    //Since the job(child) is stopped, its job status would be modified
+    struct job_t *chld_job= getjobpid(jobs, pid);
+    chld_job->state = ST;
  
- while (pid>0){
-  deletejob(jobs,pid);
+    int chld_jid = chld_job->jid;		//its corr. jid
+    
+    printf("Job [%d] (%d) stopped by signal %d\n",  chld_jid, pid, WSTOPSIG(chld_stat));
+    // WSTOPSIG generates sig number of the child's status which is stopped
+    
+   
+  } 
+
  }
+ 
  errno= olderrno;		//replace to the restored one
     return;
 }
